@@ -1,0 +1,116 @@
+# ============================================================
+# .NET
+# ============================================================
+
+## Build outputs
+bin/
+obj/
+out/
+
+## NuGet
+*.nupkg
+*.snupkg
+.nuget/
+packages/
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+## Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.userprefs
+
+## Rider
+.idea/
+
+## Test results
+TestResults/
+[Tt]est[Rr]esult*/
+*.trx
+*.coverage
+*.coveragexml
+
+## Publish profiles
+**/Properties/PublishProfiles/
+
+## Runtime / config
+launchSettings.json
+appsettings.Development.json
+appsettings.Local.json
+
+## Entity Framework migrations temp
+*.migrations.designer.cs
+
+# ============================================================
+# Java
+# ============================================================
+
+## Build outputs
+target/
+build/
+dist/
+*.class
+*.jar
+*.war
+*.ear
+*.nar
+
+## Maven
+.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+
+## Gradle
+.gradle/
+gradle-app.setting
+!gradle/wrapper/gradle-wrapper.jar
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+## IDEs
+.idea/
+*.iml
+*.iws
+.eclipse
+.metadata
+.classpath
+.project
+.settings/
+.springBeans
+.sts4-cache/
+
+## Logs
+*.log
+logs/
+
+## Spring Boot
+*.pid
+
+## Checkstyle / PMD / SpotBugs
+checkstyle-cachefile
+
+# ============================================================
+# Common
+# ============================================================
+
+## OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+## Environment
+.env
+.env.*
+!.env.example
+
+## Docker
+docker-compose.override.yml
+
+## Editor
+*.swp
+*.swo
+*~
