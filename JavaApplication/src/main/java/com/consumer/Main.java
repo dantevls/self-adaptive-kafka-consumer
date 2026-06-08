@@ -2,7 +2,6 @@ package com.consumer;
 
 import com.consumer.application.AdaptiveConfig;
 import com.consumer.application.ControllerPI;
-import com.consumer.application.LogEntry;
 import com.consumer.application.Monitor;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -18,9 +17,13 @@ import java.io.InputStream;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Properties;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.locks.ReentrantLock;
 
 public class Main {
@@ -38,8 +41,8 @@ public class Main {
         int     fetchMaxBytes     = Integer.parseInt(appConfig.getProperty("consumer.fetchMaxBytes"));
         int     fetchWaitMaxMs    = Integer.parseInt(appConfig.getProperty("consumer.fetchWaitMaxMs"));
         int     logIntervalSecs   = Integer.parseInt(appConfig.getProperty("consumer.logIntervalSeconds"));
-        int     piIntervalSecs    = Integer.parseInt(appConfig.getProperty("monitor.piIntervalSeconds"));
-        boolean monitorEnabled    = Boolean.parseBoolean(appConfig.getProperty("monitor.enabled", "true"));
+        int     sampleIntervalSecs  = Integer.parseInt(appConfig.getProperty("monitor.sampleIntervalSeconds"));
+        boolean controllerEnabled   = Boolean.parseBoolean(appConfig.getProperty("controller.enabled", "true"));
         int     maxPollRecordsLimit = Integer.parseInt(appConfig.getProperty("consumer.maxPollRecordsLimit"));
         int     stepRecords       = Integer.parseInt(appConfig.getProperty("benchmark.stepRecords"));
         int     stepIntervalSecs  = Integer.parseInt(appConfig.getProperty("benchmark.stepIntervalSeconds"));
@@ -51,47 +54,70 @@ public class Main {
         ControllerPI pi      = null;
         Monitor      monitor = null;
 
-        if (monitorEnabled) {
+        double[] targetRates = Arrays.stream(appConfig.getProperty("controller.targetRate").split(","))
+                .mapToDouble(s -> Double.parseDouble(s.trim()))
+                .toArray();
+        int targetRateIntervalSecs = Integer.parseInt(appConfig.getProperty("controller.targetRateIntervalSeconds"));
+
+        if (controllerEnabled) {
             pi = new ControllerPI(
-                    Double.parseDouble(appConfig.getProperty("monitor.pi.kp")),
-                    Double.parseDouble(appConfig.getProperty("monitor.pi.ki")),
-                    Double.parseDouble(appConfig.getProperty("monitor.pi.targetPollRecords")),
-                    piIntervalSecs);
+                    Double.parseDouble(appConfig.getProperty("controller.kp")),
+                    Double.parseDouble(appConfig.getProperty("controller.ki")),
+                    targetRates[0],
+                    sampleIntervalSecs,
+                    MIN_MAX_POLL_RECORDS,
+                    maxPollRecordsLimit);
 
             monitor = new Monitor(
                     logPath,
-                    piIntervalSecs,
+                    sampleIntervalSecs,
                     Integer.parseInt(appConfig.getProperty("monitor.readIntervalSeconds")),
                     logLock);
+
+            double u = pi.compute(0);
+            currentMaxPollRecords = (int) Math.round(u);
         }
 
         AdaptiveConfig cfg = buildConfig(currentMaxPollRecords, fetchMaxBytes, fetchWaitMaxMs);
 
-        System.out.printf("Consumer started. Monitor=%b%n", monitorEnabled);
-        if (monitorEnabled)
-            System.out.printf("Log: %s | log every %ds | PI every %ds%n", logPath, logIntervalSecs, piIntervalSecs);
+        System.out.printf("Consumer started. Monitor=%b%n", controllerEnabled);
+        if (controllerEnabled)
+            System.out.printf("Log: %s | log every %ds | sample every %ds%n", logPath, logIntervalSecs, sampleIntervalSecs);
         else
             System.out.printf("Log: %s | log every %ds | step -%d records every %ds%n",
                     logPath, logIntervalSecs, stepRecords, stepIntervalSecs);
 
-        int    logNumber  = 0;
-        Instant nextLogAt  = Instant.now().plusSeconds(logIntervalSecs);
-        Instant nextStepAt = Instant.now().plusSeconds(stepIntervalSecs);
-        List<LogEntry> queue = new ArrayList<>();
+        int    logNumber      = 0;
+        int    batchMessages  = 0;
+        Instant nextLogAt       = Instant.now().plusSeconds(logIntervalSecs);
+        Instant nextStepAt      = Instant.now().plusSeconds(stepIntervalSecs);
+        int     targetIndex     = 0;
+        Instant nextTargetAt    = Instant.now().plusSeconds(targetRateIntervalSecs);
+
+        ExecutorService executor = Executors.newCachedThreadPool();
 
         KafkaConsumer<String, String> consumer = buildConsumer(bootstrapServers, groupId, cfg);
         consumer.subscribe(Collections.singletonList(topic));
 
         while (true) {
-            // ── ReceiveMessage / ProcessMessage ──────────────────────────────
+            // ReceiveMessage / ProcessMessage (parallel per record)
             try {
                 ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(200));
+
+                List<Future<long[]>> futures = new ArrayList<>();
                 for (ConsumerRecord<String, String> record : records) {
-                    queue.add(new LogEntry(
-                            record.partition() + "-" + record.offset(),
-                            record.value() != null ? record.value().length() : 0,
-                            cfg.maxPollRecords));
+                    final String value = record.value();
+                    futures.add(executor.submit(() -> {
+                        Thread.sleep(100); // simulate 100ms processing per message
+                        long bytes = value != null ? value.length() : 0;
+                        return new long[]{1L, bytes};
+                    }));
                 }
+                for (Future<long[]> f : futures) {
+                    long[] result = f.get();
+                    batchMessages += (int) result[0];
+                }
+
                 if (!records.isEmpty()) {
                     consumer.commitSync();
                 }
@@ -101,14 +127,21 @@ public class Main {
 
             Instant now = Instant.now();
 
-            // ── Adaptive control: PI (monitor on) or step decrement (monitor off)
-            if (monitorEnabled) {
+            // ── Target rate cycling ───────────────────────────────────────────
+            if (controllerEnabled && !now.isBefore(nextTargetAt)) {
+                targetIndex = (targetIndex + 1) % targetRates.length;
+                pi.setTargetRate(targetRates[targetIndex]);
+                System.out.printf("[Controller] Target rate changed to %.0f msg/s%n", targetRates[targetIndex]);
+                nextTargetAt = nextTargetAt.plusSeconds(targetRateIntervalSecs);
+            }
+
+            // ── Adaptive control: PI (monitor on) or step increment (monitor off) ──
+            if (controllerEnabled) {
                 Double observed = monitor.tryObserve();
                 if (observed != null) {
                     double u = pi.compute(observed);
-                    currentMaxPollRecords = (int) Math.max(MIN_MAX_POLL_RECORDS,
-                            Math.min(maxPollRecordsLimit, Math.round(u)));
-                    System.out.printf("[Consumer] PI → max.poll.records=%d%n", currentMaxPollRecords);
+                    currentMaxPollRecords = (int) Math.round(u);
+                    System.out.printf("[Consumer] PI - max.poll.records=%d%n", currentMaxPollRecords);
 
                     cfg = buildConfig(currentMaxPollRecords, fetchMaxBytes, fetchWaitMaxMs);
                     consumer.close();
@@ -116,8 +149,8 @@ public class Main {
                     consumer.subscribe(Collections.singletonList(topic));
                 }
             } else if (!now.isBefore(nextStepAt)) {
-                currentMaxPollRecords = Math.max(currentMaxPollRecords - stepRecords, MIN_MAX_POLL_RECORDS);
-                System.out.printf("[Benchmark] Step → max.poll.records=%d%n", currentMaxPollRecords);
+                currentMaxPollRecords = Math.max(currentMaxPollRecords + stepRecords, MIN_MAX_POLL_RECORDS);
+                System.out.printf("[Benchmark] Step - max.poll.records=%d%n", currentMaxPollRecords);
 
                 cfg = buildConfig(currentMaxPollRecords, fetchMaxBytes, fetchWaitMaxMs);
                 consumer.close();
@@ -126,12 +159,12 @@ public class Main {
                 nextStepAt = nextStepAt.plusSeconds(stepIntervalSecs);
             }
 
-            // ── Log timer ─────────────────────────────────────────────────────
+            // Log timer
             if (!now.isBefore(nextLogAt)) {
                 logNumber++;
-                writeLogBatch(logPath, logNumber, cfg.maxPollRecords, queue, logLock);
-                System.out.printf("[Consumer] Log %d — %d messages%n", logNumber, queue.size());
-                queue.clear();
+                writeLogBatch(logPath, cfg.maxPollRecords, batchMessages,  targetRates[targetIndex],  logLock);
+                System.out.printf("[Consumer] Log %d | messages=%d | max.poll.records=%d%n", logNumber, batchMessages, cfg.maxPollRecords);
+                batchMessages = 0;
                 nextLogAt = nextLogAt.plusSeconds(logIntervalSecs);
             }
         }
@@ -157,22 +190,15 @@ public class Main {
         return new KafkaConsumer<>(props);
     }
 
-    private static void writeLogBatch(String path, int logNumber, int maxPollRecords,
-                                       List<LogEntry> entries, ReentrantLock logLock) throws IOException {
-        List<String> lines = new ArrayList<>();
-        lines.add(String.format("--- Log %d | %s | max.poll.records=%d | messages=%d ---",
-                logNumber, Instant.now(), maxPollRecords, entries.size()));
-        for (LogEntry e : entries) {
-            lines.add(e.messageId + "|" + e.bytes + "|" + e.maxPollRecords);
-        }
-        lines.add("");
+    private static void writeLogBatch(String path, int maxPollRecords,
+                                       int messages, double setpoint, ReentrantLock logLock) throws IOException {
+        String line = String.format("%s|messages=%d|setpoint=%d|max.poll.records=%d",
+                Instant.now(), messages, (int) setpoint, maxPollRecords);
 
         logLock.lock();
         try (BufferedWriter writer = new BufferedWriter(new FileWriter(path, true))) {
-            for (String line : lines) {
-                writer.write(line);
-                writer.newLine();
-            }
+            writer.write(line);
+            writer.newLine();
         } finally {
             logLock.unlock();
         }

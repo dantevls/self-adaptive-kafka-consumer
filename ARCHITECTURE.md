@@ -96,34 +96,41 @@ Both implementations follow the same loop structure. They differ only in which K
 ```
 STARTUP
   Read config file
-  IF monitorEnabled:
-      Build ControllerPI(Kp, Ki, target, dt)
-      Build Monitor(logPath, piIntervalSecs, readIntervalSecs)
+  IF controllerEnabled:
+      Build ControllerPI(Kp, Ki, targetRate, dt)
+      Build Monitor(logPath, sampleIntervalSecs, readIntervalSecs, logLock)
 
 LOOP (repeats forever)
   records = consumer.poll(200 ms)
-  FOR each record:
+
+  [Java only] FOR each record:
+      submit to ExecutorService → sleep(100ms) + accumulate bytes   ← parallel processing
+  [Java only] await all futures; accumulate batchMessages, batchBytes
+
+  [.NET only] FOR each record:
       queue.Add(entry)          ← messageId | bytes | currentControlledValue
+
   IF records not empty:
       consumer.commitSync()
 
-  IF monitorEnabled:
-      observed = monitor.tryObserve()   ← null unless PI interval elapsed
+  IF controllerEnabled:
+      observed = monitor.tryObserve()   ← null unless sample interval elapsed
       IF observed != null:
           u = pi.compute(observed)      ← new value for controlled variable
           currentValue = clamp(u, MIN, LIMIT)
           rebuild consumer with new config
 
   ELSE IF benchmark mode AND stepInterval elapsed:
-      currentValue -= stepAmount        ← blind decrement
-      currentValue = max(currentValue, MIN)
+      [.NET] currentValue -= stepAmount        ← blind decrement
+      [Java] currentValue += stepAmount        ← blind increment (ramps up from MIN)
+      currentValue = clamp(currentValue, MIN, LIMIT)
       rebuild consumer with new config
       advance nextStepAt
 
   IF logInterval elapsed:
       logNumber++
-      writeLogBatch(logPath, logNumber, currentValue, queue)
-      queue.clear()
+      writeLogBatch(logPath, logNumber, currentValue, queue/batch)
+      queue.clear() / reset batchMessages & batchBytes
       advance nextLogAt
 ```
 
@@ -209,24 +216,26 @@ Every PiIntervalSeconds (60 s):
 ### Files
 | File | Role |
 |---|---|
-| `Main.java` | Main loop — orchestrates consumer, adaptive control, log timer |
-| `Monitor.java` | Daemon thread — reads log file, computes rec/s, exposes `tryObserve()` |
+| `Main.java` | Main loop — orchestrates consumer, parallel processing, adaptive control, log timer |
+| `Monitor.java` | Daemon thread — reads log file, computes rec/s, exposes `tryObserve()`; shares a `ReentrantLock` with Main to coordinate file access |
 | `ControllerPI.java` | Pure PI math — `compute(measuredRate)` → new `max.poll.records` |
 | `AdaptiveConfig.java` | Immutable config snapshot passed to each new consumer instance |
-| `LogEntry.java` | Value object: `messageId`, `bytes`, `maxPollRecords` |
 | `application.properties` | All runtime parameters |
 
-### Benchmark mode (default, `monitor.enabled = false`)
+### Parallel message processing (Java only)
+Each record returned by `poll()` is submitted to a **cached thread pool** (`Executors.newCachedThreadPool()`). Each task sleeps 100 ms (simulating per-message work) and returns `{count=1, bytes}`. The main thread awaits all futures before proceeding to the control and log steps.
+
+### Benchmark mode (default, `controller.enabled = false`)
 ```
-Every benchmark.stepIntervalSeconds (30 s):
-    max.poll.records -= benchmark.stepRecords (50)
-    clamped to [MIN_MAX_POLL_RECORDS=1, initialMaxPollRecords=500]
+Every benchmark.stepIntervalSeconds (180 s):
+    max.poll.records += benchmark.stepRecords (10)   ← ramps UP from initialMaxPollRecords=10
+    clamped to [MIN_MAX_POLL_RECORDS=1, maxPollRecordsLimit=1000]
 ```
 
-### Monitor mode (`monitor.enabled = true`)
+### Monitor / PI mode (`controller.enabled = true`)
 ```
-Every monitor.piIntervalSeconds (60 s):
-    y = records_consumed / piInterval   (rec/s, read from log file)
+Every monitor.sampleIntervalSeconds (180 s):
+    y = messages_consumed / sampleInterval   (rec/s, read from log file)
     u = ControllerPI.compute(y)
     max.poll.records = clamp(round(u), 1, maxPollRecordsLimit)
 ```
@@ -238,21 +247,22 @@ kafka.topic=adaptive-topic
 kafka.groupId=adaptive-consumer-group
 
 consumer.logPath=…/logs/consumer_log.txt
-consumer.initialMaxPollRecords=500
-consumer.maxPollRecordsLimit=10
+consumer.initialMaxPollRecords=10
+consumer.maxPollRecordsLimit=1000
 consumer.fetchMaxBytes=1048576
 consumer.fetchWaitMaxMs=500
-consumer.logIntervalSeconds=30
+consumer.logIntervalSeconds=1
 
-monitor.enabled=false
-monitor.piIntervalSeconds=60
-monitor.readIntervalSeconds=60
-monitor.pi.kp=1.0
-monitor.pi.ki=0.01
-monitor.pi.targetPollRecords=50.0
+monitor.sampleIntervalSeconds=180
+monitor.readIntervalSeconds=180
 
-benchmark.stepRecords=50
-benchmark.stepIntervalSeconds=30
+controller.enabled=true
+controller.kp=1.0
+controller.ki=0
+controller.targetRate=<target rec/s, e.g. 300 | 500 | 700>
+
+benchmark.stepRecords=10
+benchmark.stepIntervalSeconds=180
 ```
 
 ### Fixed Kafka consumer settings (JavaApplication)
@@ -271,22 +281,26 @@ benchmark.stepIntervalSeconds=30
 
 The Monitor runs on a **background thread** (daemon thread in Java, `Task.Run` in .NET).
 
+In Java, Monitor receives the same `ReentrantLock` held by the log writer in Main so that file reads and writes never overlap.
+
 ```
 LOOP (repeats forever)
   sleep(readIntervalSeconds)
 
-  current = countLogRecords(logPath)   ← counts non-header, non-blank lines
+  current = countLogRecords(logPath)
+      [Java]  acquire logLock; sum messages= field from each summary line; release
+      [.NET]  count non-header, non-blank lines
 
-  IF now >= nextPiAt:
-      m = current − totalRecordsSeen   ← records since last PI tick
-      y = m / piIntervalSeconds        ← rate in rec/s
+  IF now >= nextSampleAt:
+      m = current − totalRecordsSeen   ← records since last sample tick
+      y = m / sampleIntervalSeconds    ← rate in rec/s
       totalRecordsSeen = current
       pendingRate = y                  ← made available via tryObserve()
-      nextPiAt += piInterval
+      nextSampleAt += sampleInterval
       print "[Monitor] m=… | y=… rec/s"
 ```
 
-`tryObserve()` is called on the consumer thread every loop iteration. It returns `y` once per PI interval (then resets to null), so the consumer thread is never blocked.
+`tryObserve()` is called on the consumer thread every loop iteration. It returns `y` once per sample interval (then resets to null), so the consumer thread is never blocked.
 
 ---
 
@@ -308,10 +322,12 @@ u        = P + I                     → returned as new controlled value
 | Parameter | Value | Meaning |
 |---|---|---|
 | `Kp` | 1.0 | Proportional gain |
-| `Ki` | 0.01 | Integral gain |
+| `Ki` (.NET) | 0.01 | Integral gain |
+| `Ki` (Java) | 0 | Integral gain (pure-P by default) |
 | `target` (.NET) | 1 000.0 | Target rate in rec/s (`TargetPollIntervalMs`) |
-| `target` (Java) | 50.0 | Target rate in rec/s (`targetPollRecords`) |
-| `dt` | 60 s | Sampling period (`piIntervalSeconds`) |
+| `target` (Java) | configurable | Target throughput in rec/s (`controller.targetRate`) |
+| `dt` (.NET) | 60 s | Sampling period (`piIntervalSeconds`) |
+| `dt` (Java) | 180 s | Sampling period (`monitor.sampleIntervalSeconds`) |
 
 ---
 
@@ -332,18 +348,14 @@ Written by both implementations. Append-only. Same structure.
 
 ### JavaApplication format
 ```
---- Log 1 | 2026-06-01T10:00:00Z | max.poll.records=500 | messages=1843731 ---
-0-100|999904|500
-0-101|999904|500
-...
-
---- Log 2 | 2026-06-01T10:00:30Z | max.poll.records=450 | messages=1612044 ---
+2026-06-01T10:00:00Z|messages=1843731|bytes=1843522624|max.poll.records=10
+2026-06-01T10:00:01Z|messages=1612044|bytes=1611920576|max.poll.records=10
 ...
 ```
 
-Data line format: `partition-offset | bytes | controlledValue`
+Each line is one batch summary written every `logIntervalSeconds` (default 1 s). Fields: timestamp, total messages in the batch, total bytes, current `max.poll.records`.
 
-The Monitor reads this file to count total records consumed, which is used to compute the rec/s rate fed into the PI controller.
+The Monitor sums the `messages=` field across all lines to get the cumulative record count, which is used to compute the rec/s rate fed into the PI controller.
 
 ---
 
@@ -385,8 +397,8 @@ Produce() ──────────────▶ [partition 0]           
 | Class / File | Decides anything? | What it does |
 |---|---|---|
 | `Producer/Program.cs` | No | Produces at max rate using fixed config |
-| `Program.cs` / `Main.java` | No | Runs the consume loop, logs, rebuilds consumer |
-| `Monitor.cs` / `Monitor.java` | No | Measures rec/s from log file; exposes rate |
+| `Program.cs` / `Main.java` | No | Runs the consume loop, logs, rebuilds consumer; Java: dispatches record processing to thread pool |
+| `Monitor.cs` / `Monitor.java` | No | Measures rec/s from log file; exposes rate; Java: holds shared `ReentrantLock` with writer |
 | `ControllerPI.cs` / `ControllerPI.java` | **YES** | Computes PI output → new controlled value |
 | `appsettings.json` / `application.properties` | No | Stores all tunable parameters |
 | `docker-compose.yml` | No | Wires containers, overrides bootstrap address |

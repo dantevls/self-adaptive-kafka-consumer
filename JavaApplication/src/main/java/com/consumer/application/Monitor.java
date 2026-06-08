@@ -10,26 +10,31 @@ import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Runs a daemon loop that reads the log file every readIntervalSeconds.
- * When the PI interval elapses, computes y = m/d (records/s) and makes it
+ * When the sample interval elapses, computes y = m/d (records/s) and makes it
  * available via tryObserve(). All file I/O is off the consumer thread.
  */
 public final class Monitor {
-    private final String       logPath;
-    private final Duration     piInterval;
-    private final Duration     readInterval;
+    private final String        logPath;
+    private final Duration      sampleInterval;
+    private final Duration      readInterval;
     private final ReentrantLock logLock;
 
     private long    totalRecordsSeen;
-    private Instant nextPiAt;
+    private Instant nextSampleAt;
     private Double  pendingRate;
     private final Object sync = new Object();
 
-    public Monitor(String logPath, int piIntervalSeconds, int readIntervalSeconds, ReentrantLock logLock) {
-        this.logPath      = logPath;
-        this.piInterval   = Duration.ofSeconds(piIntervalSeconds);
-        this.readInterval = Duration.ofSeconds(readIntervalSeconds);
-        this.logLock      = logLock;
-        this.nextPiAt     = Instant.now().plus(piInterval);
+    public Monitor(String logPath, int sampleIntervalSeconds, int readIntervalSeconds, ReentrantLock logLock) {
+        this.logPath        = logPath;
+        this.sampleInterval = Duration.ofSeconds(sampleIntervalSeconds);
+        this.readInterval   = Duration.ofSeconds(readIntervalSeconds);
+        this.logLock        = logLock;
+        this.nextSampleAt   = Instant.now().plus(sampleInterval);
+
+        // warmup: snapshot current file state so the first measurement
+        // only counts messages produced AFTER the controller starts
+        try { this.totalRecordsSeen = countLogRecords(); }
+        catch (Exception ignored) {}
 
         Thread t = new Thread(this::runLoop, "monitor-thread");
         t.setDaemon(true);
@@ -45,12 +50,12 @@ public final class Monitor {
                 Instant now  = Instant.now();
 
                 synchronized (sync) {
-                    if (!now.isBefore(nextPiAt)) {
+                    if (!now.isBefore(nextSampleAt)) {
                         long   m = current - totalRecordsSeen;
-                        double y = m / (double) piInterval.getSeconds();
+                        double y = m / (double) sampleInterval.getSeconds();
                         totalRecordsSeen = current;
                         pendingRate      = y;
-                        nextPiAt         = nextPiAt.plus(piInterval);
+                        nextSampleAt     = nextSampleAt.plus(sampleInterval);
                         System.out.printf("[Monitor] m=%d records | y=%.2f rec/s%n", m, y);
                     }
                 }
@@ -64,7 +69,7 @@ public final class Monitor {
     }
 
     /**
-     * Returns y (rec/s) if the PI interval elapsed since the last call; null otherwise.
+     * Returns y (rec/s) if the sample interval elapsed since the last call; null otherwise.
      * Non-blocking — safe to call on every consumer iteration.
      */
     public Double tryObserve() {
@@ -81,13 +86,18 @@ public final class Monitor {
 
         logLock.lock();
         try (BufferedReader reader = new BufferedReader(new FileReader(f))) {
-            long count = 0;
+            long total = 0;
             String line;
             while ((line = reader.readLine()) != null) {
-                if (line.isBlank() || line.startsWith("--- ")) continue;
-                count++;
+                if (line.isBlank()) continue;
+                for (String part : line.split("\\|")) {
+                    if (part.startsWith("messages=")) {
+                        total += Long.parseLong(part.substring("messages=".length()));
+                        break;
+                    }
+                }
             }
-            return count;
+            return total;
         } finally {
             logLock.unlock();
         }
